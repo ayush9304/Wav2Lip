@@ -86,27 +86,36 @@ def face_detect(images):
 
 	results = []
 	pady1, pady2, padx1, padx2 = args.pads
-	for rect, image in zip(predictions, images):
-		if rect is None:
-			cv2.imwrite('temp/faulty_frame.jpg', image) # check this frame where the face was not detected.
-			raise ValueError('Face not detected! Ensure the video contains a face in all the frames.')
 
-		y1 = max(0, rect[1] - pady1)
-		y2 = min(image.shape[0], rect[3] + pady2)
-		x1 = max(0, rect[0] - padx1)
-		x2 = min(image.shape[1], rect[2] + padx2)
+	# list to store whether a face is detected in the image or not
+	face_detected = [1]*len(predictions)
+
+	for i, (rect, image) in enumerate(zip(predictions, images)):
+		if rect is None:
+			face_detected[i] = 0
+			x1, x2, y1, y2 = 0, args.img_size, 0, args.img_size
+			# cv2.imwrite('temp/faulty_frame.jpg', image) # check this frame where the face was not detected.
+			# raise ValueError('Face not detected! Ensure the video contains a face in all the frames.')
+		else:
+			y1 = max(0, rect[1] - pady1)
+			y2 = min(image.shape[0], rect[3] + pady2)
+			x1 = max(0, rect[0] - padx1)
+			x2 = min(image.shape[1], rect[2] + padx2)
 		
 		results.append([x1, y1, x2, y2])
 
 	boxes = np.array(results)
-	if not args.nosmooth: boxes = get_smoothened_boxes(boxes, T=5)
-	results = [[image[y1: y2, x1:x2], (y1, y2, x1, x2)] for image, (x1, y1, x2, y2) in zip(images, boxes)]
+	if not args.nosmooth:				                                       # Not Efficient !! TODO
+		boxes_to_smooth = boxes[np.where(np.array(face_detected) == 1)]
+		smoothened_boxes = get_smoothened_boxes(boxes_to_smooth, T=5)
+		boxes[np.where(np.array(face_detected) == 1)] = smoothened_boxes
+	results = [[image[y1: y2, x1:x2], (y1, y2, x1, x2), fd] for image, (x1, y1, x2, y2), fd in zip(images, boxes, face_detected)]
 
 	del detector
 	return results 
 
 def datagen(frames, mels):
-	img_batch, mel_batch, frame_batch, coords_batch = [], [], [], []
+	img_batch, mel_batch, frame_batch, coords_batch, is_face_batch = [], [], [], [], []
 
 	if args.box[0] == -1:
 		if not args.static:
@@ -121,7 +130,7 @@ def datagen(frames, mels):
 	for i, m in enumerate(mels):
 		idx = 0 if args.static else i%len(frames)
 		frame_to_save = frames[idx].copy()
-		face, coords = face_det_results[idx].copy()
+		face, coords, is_face = face_det_results[idx].copy()
 
 		face = cv2.resize(face, (args.img_size, args.img_size))
 			
@@ -129,6 +138,7 @@ def datagen(frames, mels):
 		mel_batch.append(m)
 		frame_batch.append(frame_to_save)
 		coords_batch.append(coords)
+		is_face_batch.append(is_face)
 
 		if len(img_batch) >= args.wav2lip_batch_size:
 			img_batch, mel_batch = np.asarray(img_batch), np.asarray(mel_batch)
@@ -139,8 +149,8 @@ def datagen(frames, mels):
 			img_batch = np.concatenate((img_masked, img_batch), axis=3) / 255.
 			mel_batch = np.reshape(mel_batch, [len(mel_batch), mel_batch.shape[1], mel_batch.shape[2], 1])
 
-			yield img_batch, mel_batch, frame_batch, coords_batch
-			img_batch, mel_batch, frame_batch, coords_batch = [], [], [], []
+			yield img_batch, mel_batch, frame_batch, coords_batch, is_face_batch
+			img_batch, mel_batch, frame_batch, coords_batch, is_face_batch = [], [], [], [], []
 
 	if len(img_batch) > 0:
 		img_batch, mel_batch = np.asarray(img_batch), np.asarray(mel_batch)
@@ -151,7 +161,7 @@ def datagen(frames, mels):
 		img_batch = np.concatenate((img_masked, img_batch), axis=3) / 255.
 		mel_batch = np.reshape(mel_batch, [len(mel_batch), mel_batch.shape[1], mel_batch.shape[2], 1])
 
-		yield img_batch, mel_batch, frame_batch, coords_batch
+		yield img_batch, mel_batch, frame_batch, coords_batch, is_face_batch
 
 mel_step_size = 16
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -246,7 +256,7 @@ def main():
 	batch_size = args.wav2lip_batch_size
 	gen = datagen(full_frames.copy(), mel_chunks)
 
-	for i, (img_batch, mel_batch, frames, coords) in enumerate(tqdm(gen, 
+	for i, (img_batch, mel_batch, frames, coords, is_face_batch) in enumerate(tqdm(gen, 
 											total=int(np.ceil(float(len(mel_chunks))/batch_size)))):
 		if i == 0:
 			model = load_model(args.checkpoint_path)
@@ -256,6 +266,10 @@ def main():
 			out = cv2.VideoWriter('temp/result.avi', 
 									cv2.VideoWriter_fourcc(*'DIVX'), fps, (frame_w, frame_h))
 
+		# Filter out un-detected faces before inference
+		img_batch = np.array(img_batch)[np.where(np.array(is_face_batch) == 1)]
+		mel_batch = np.array(mel_batch)[np.where(np.array(is_face_batch) == 1)]
+
 		img_batch = torch.FloatTensor(np.transpose(img_batch, (0, 3, 1, 2))).to(device)
 		mel_batch = torch.FloatTensor(np.transpose(mel_batch, (0, 3, 1, 2))).to(device)
 
@@ -263,12 +277,27 @@ def main():
 			pred = model(mel_batch, img_batch)
 
 		pred = pred.cpu().numpy().transpose(0, 2, 3, 1) * 255.
-		
-		for p, f, c in zip(pred, frames, coords):
-			y1, y2, x1, x2 = c
-			p = cv2.resize(p.astype(np.uint8), (x2 - x1, y2 - y1))
 
-			f[y1:y2, x1:x2] = p
+		# inserting blank frames back into batch if face was not detected
+		final_pred = []
+
+		idx = 0
+		pred_h, pred_w, pred_c = pred.shape[1:]
+		for i,is_face_ in enumerate(is_face_batch):
+			if is_face_:
+				final_pred.append(pred[idx])
+				idx+=1
+			else:
+				final_pred.append(np.zeros((pred_h, pred_w, pred_c)))
+			    
+		final_pred = np.array(final_pred)
+		
+		for p, f, c, is_f in zip(final_pred, frames, coords, is_face_batch):
+			if is_f:
+				y1, y2, x1, x2 = c
+				p = cv2.resize(p.astype(np.uint8), (x2 - x1, y2 - y1))
+
+				f[y1:y2, x1:x2] = p
 			out.write(f)
 
 	out.release()
